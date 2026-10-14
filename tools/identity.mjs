@@ -1,0 +1,267 @@
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { readLogo } from './logo.mjs';
+
+export const ROLE_NAMES = ['background', 'surface', 'primary', 'secondary', 'muted', 'text', 'danger'];
+const ANSI_NAMES = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'];
+
+export function parseToml(text) {
+  const data = {};
+  let section = data;
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    const head = line.match(/^\[([a-z_]+)\]/);
+    if (head) { section = data[head[1]] = data[head[1]] || {}; continue; }
+    const kv = line.match(/^([a-z_]+)\s*=\s*"([^"]*)"/);
+    if (kv) section[kv[1]] = kv[2];
+  }
+  return data;
+}
+
+const hexToRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+const rgbToHex = (rgb) => '#' + rgb.map((v) => Math.round(Math.max(0, Math.min(255, v))).toString(16).padStart(2, '0')).join('');
+
+export function mix(a, b, weightOfA) {
+  const ra = hexToRgb(a), rb = hexToRgb(b);
+  return rgbToHex(ra.map((v, i) => v * weightOfA + rb[i] * (1 - weightOfA)));
+}
+
+function luminance(hex) {
+  const [r, g, b] = hexToRgb(hex).map((v) => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+export function contrast(a, b) {
+  const la = luminance(a), lb = luminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+export function readableMuted(foreground, background, surface) {
+  for (let weight = 0.7; weight <= 1.0001; weight += 0.05) {
+    const candidate = mix(foreground, background, weight);
+    if (contrast(candidate, background) >= 4.5 && contrast(candidate, surface) >= 4.5) return candidate;
+  }
+  return foreground;
+}
+
+export function readableOn(color, towards, backgrounds, min) {
+  for (let weight = 0; weight <= 1.0001; weight += 0.05) {
+    const candidate = mix(towards, color, weight);
+    if (backgrounds.every(([bg, need]) => contrast(candidate, bg) >= (need || min))) return candidate;
+  }
+  return towards;
+}
+
+function terminalPalette(c, ansi) {
+  let background = c.dark_background, surface = c.lighter_background, foreground = c.foreground, bright = c.bright_foreground, line = c.muted;
+  if (luminance(background) > 0.18) {
+    background = mix(c.background, '#000000', 0.12);
+    surface = mix(c.background, '#000000', 0.22);
+    foreground = mix(c.background, '#ffffff', 0.12);
+    bright = '#ffffff';
+    line = mix(c.background, '#000000', 0.35);
+    Object.assign(ansi, { 30: background, 37: foreground, 97: bright });
+  }
+  const on = [[background, 5.5], [surface, 4.5]];
+  const muted = readableMuted(foreground, background, surface);
+  ansi[90] = muted;
+  return {
+    background, surface, foreground, line, cursor: bright, selection: c.selection, ansi, muted,
+    accent: readableOn(c.accent, bright, on, 5.5),
+    prompt: readableOn(c.magenta, bright, on, 5.5),
+    error: readableOn(c.red, bright, [[background, 4.5], [surface, 4.5]], 4.5),
+  };
+}
+
+export const TEXT_MIN = 5.5;
+
+export function readableText(color, text, background, surface) {
+  return readableOn(color, text, [[background, TEXT_MIN], [surface, 4.5]], TEXT_MIN);
+}
+
+export function textRoles(identity, theme) {
+  const r = theme.roles;
+  const out = {};
+  for (const [role, color] of Object.entries(identity.roles)) out[role] = readableText(r[color], r.text, r.background, r.surface);
+  return out;
+}
+
+export function loadTheme(root, name) {
+  const dir = join(root, 'themes', name);
+  const colorsFile = join(dir, 'colors.toml');
+  if (!existsSync(colorsFile)) throw new Error(`tema "${name}" não encontrado: falta ${colorsFile}`);
+  const c = parseToml(readFileSync(colorsFile, 'utf8'));
+  const overrides = existsSync(join(dir, 'theme.toml')) ? parseToml(readFileSync(join(dir, 'theme.toml'), 'utf8')) : {};
+  for (const key of ['background', 'lighter_background', 'dark_background', 'accent', 'magenta', 'foreground', 'bright_foreground', 'red', 'muted', 'selection']) {
+    if (!c[key]) throw new Error(`tema "${name}": colors.toml sem a chave "${key}"`);
+  }
+  const ansi = {};
+  ANSI_NAMES.forEach((n, i) => {
+    ansi[30 + i] = n === 'black' ? c.background : n === 'white' ? c.foreground : c[n];
+    ansi[90 + i] = n === 'black' ? c.muted : n === 'white' ? c.bright_foreground : c[`bright_${n}`];
+  });
+  const roles = {
+    background: c.background,
+    surface: c.lighter_background,
+    primary: c.accent,
+    secondary: c.magenta,
+    muted: readableMuted(c.foreground, c.background, c.lighter_background),
+    text: c.bright_foreground,
+    danger: c.red,
+    ...(overrides.roles || {}),
+  };
+  return {
+    name,
+    mode: c.mode || 'dark',
+    roles,
+    line: c.muted,
+    terminal: { ...terminalPalette(c, ansi), ...(overrides.terminal || {}) },
+  };
+}
+
+export function contrastReport(theme, text = {}) {
+  const r = theme.roles, t = theme.terminal;
+  const rows = [
+    ...Object.entries(text).map(([role, color]) => [`${role} (texto) on background`, color, r.background, TEXT_MIN, 'fail']),
+    ['text on background', r.text, r.background, 4.5, 'fail'],
+    ['text on surface', r.text, r.surface, 4.5, 'fail'],
+    ['terminal foreground on terminal background', t.foreground, t.background, 4.5, 'fail'],
+    ['terminal foreground on terminal bar', t.foreground, t.surface, 4.5, 'fail'],
+    ['terminal muted on terminal background', t.muted, t.background, 4.5, 'fail'],
+    ['terminal muted on terminal bar', t.muted, t.surface, 4.5, 'fail'],
+    ['terminal prompt on terminal background', t.prompt, t.background, 5.5, 'fail'],
+    ['terminal accent on terminal background', t.accent, t.background, 5.5, 'fail'],
+    ['terminal error on terminal background', t.error, t.background, 4.5, 'fail'],
+    ['muted on background', r.muted, r.background, 4.5, 'fail'],
+    ['muted on surface', r.muted, r.surface, 4.5, 'warn'],
+    ['primary on background', r.primary, r.background, 3, 'warn'],
+    ['secondary on background', r.secondary, r.background, 3, 'warn'],
+    ['danger on surface', r.danger, r.surface, 3, 'warn'],
+    ['ansi red on terminal background', t.ansi[31], t.background, 3, 'warn'],
+    ['ansi green on terminal background', t.ansi[32], t.background, 3, 'warn'],
+    ['ansi yellow on terminal background', t.ansi[33], t.background, 3, 'warn'],
+  ];
+  return rows.map(([label, fg, bg, min, level]) => {
+    const ratio = contrast(fg, bg);
+    return { label, fg, bg, min, ratio: Math.round(ratio * 100) / 100, status: ratio >= min ? 'pass' : level };
+  });
+}
+
+function validate(schema, value, path, defs, errors) {
+  if (schema.$ref) schema = defs[schema.$ref.replace('#/$defs/', '')];
+  const type = schema.type;
+  const actual = Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value;
+  if (type && !(type === 'integer' ? Number.isInteger(value) : actual === type)) {
+    errors.push(`${path}: esperado ${type}, veio ${actual}`);
+    return;
+  }
+  if (schema.enum && !schema.enum.includes(value)) errors.push(`${path}: valor "${value}" fora de ${schema.enum.join(', ')}`);
+  if (schema.pattern && !new RegExp(schema.pattern).test(value)) errors.push(`${path}: "${value}" não casa com ${schema.pattern}`);
+  if (schema.minLength !== undefined && value.length < schema.minLength) errors.push(`${path}: vazio`);
+  if (schema.minimum !== undefined && value < schema.minimum) errors.push(`${path}: mínimo ${schema.minimum}`);
+  if (type === 'array') {
+    if (schema.minItems !== undefined && value.length < schema.minItems) errors.push(`${path}: mínimo ${schema.minItems} itens`);
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) errors.push(`${path}: máximo ${schema.maxItems} itens`);
+    value.forEach((item, i) => validate(schema.items, item, `${path}[${i}]`, defs, errors));
+  }
+  if (type === 'object') {
+    for (const key of schema.required || []) if (!(key in value)) errors.push(`${path}: falta "${key}"`);
+    for (const [key, child] of Object.entries(value)) {
+      if (schema.properties && schema.properties[key]) validate(schema.properties[key], child, `${path}.${key}`, defs, errors);
+      else if (schema.additionalProperties === false) errors.push(`${path}: campo desconhecido "${key}"`);
+    }
+  }
+}
+
+export function validateIdentity(root, identity) {
+  const schema = JSON.parse(readFileSync(join(root, 'schemas', 'identity.schema.json'), 'utf8'));
+  const errors = [];
+  validate(schema, identity, 'identity', schema.$defs, errors);
+  if (errors.length) return errors;
+  for (const kind of fontSlots(identity)) {
+    const font = identity.fonts[kind];
+    for (const file of font.files) {
+      if (!existsSync(join(root, file.path))) errors.push(`fonts.${kind}: arquivo não encontrado: ${file.path}`);
+      else if (!font.license && !hasLicenseNote(root, font, file.path)) {
+        errors.push(`fonts.${kind}: sem licença para ${file.path}; coloque um arquivo de licença (OFL, LICENSE) ao lado da fonte ou registre "license" na fonte`);
+      }
+    }
+  }
+  errors.push(...readLogo(root, identity.logo.file).errors);
+  if (!existsSync(join(root, 'themes', identity.theme, 'colors.toml'))) errors.push(`theme: pasta themes/${identity.theme}/ sem colors.toml`);
+  return errors;
+}
+
+export const FONT_SLOTS = ['display', 'body', 'mono'];
+
+export function fontSlots(identity) {
+  return FONT_SLOTS.filter((kind) => identity.fonts[kind]);
+}
+
+const alnum = (text) => text.toLowerCase().replace(/[^a-z0-9]/g, '');
+
+function hasLicenseNote(root, font, path) {
+  const dir = dirname(path);
+  const shared = dir === 'src/fonts' || dir === 'brand/fonts';
+  const family = alnum(font.family);
+  return readdirSync(join(root, dir)).some((name) => /licen[cs]e|ofl|copying|notice/i.test(name) && (!shared || alnum(name).includes(family)));
+}
+
+function weightRange(weight) {
+  const [low, high = low] = weight.split(' ').map(Number);
+  return [low, high];
+}
+
+export function fontReport(identity) {
+  return fontSlots(identity).map((slot) => {
+    const font = identity.fonts[slot];
+    const ranges = font.files.map((file) => weightRange(file.weight));
+    const covers = (weight) => ranges.some(([low, high]) => low <= weight && weight <= high);
+    return {
+      slot,
+      family: font.family,
+      files: font.files.length,
+      weights: font.files.map((file) => file.weight.replace(' ', '-')),
+      missing: [[400, 'Regular'], [700, 'Bold']].filter(([weight]) => !covers(weight)).map(([weight, name]) => `${name} (${weight})`),
+    };
+  });
+}
+
+export function loadIdentity(root, themeOverride) {
+  const identity = JSON.parse(readFileSync(join(root, 'brand', 'identity.json'), 'utf8'));
+  const errors = validateIdentity(root, identity);
+  if (errors.length) throw new Error(`brand/identity.json inválido:\n  ${errors.join('\n  ')}`);
+  const theme = loadTheme(root, themeOverride || identity.theme);
+  theme.roles = { ...theme.roles, ...identity.colors };
+  theme.mode = identity.colors.background ? identity.mode : theme.mode;
+  return { identity, theme };
+}
+
+export function cssVariables(identity, theme) {
+  const r = theme.roles, t = theme.terminal;
+  const vars = {
+    bg: r.background, surface: r.surface, primary: r.primary, secondary: r.secondary, muted: r.muted, text: r.text, danger: r.danger,
+    line: theme.line, 'term-bg': t.background, 'term-surface': t.surface, 'term-fg': t.foreground, 'term-cursor': t.cursor, 'term-selection': t.selection,
+    'term-line': t.line, 'term-muted': t.muted, 'term-accent': t.accent, 'term-prompt': t.prompt, 'term-error': t.error,
+    ...textRoles(identity, theme),
+    'font-display': `"${identity.fonts.display.family}", sans-serif`,
+    'font-body': `"${(identity.fonts.body || identity.fonts.display).family}", sans-serif`,
+    'font-mono': `"${identity.fonts.mono.family}", monospace`,
+  };
+  for (const [code, hex] of Object.entries(t.ansi)) vars[`ansi-${code}`] = hex;
+  return `:root{${Object.entries(vars).map(([k, v]) => `--${k}:${v};`).join('')}}\n`;
+}
+
+export function fontFaces(identity, prefix = '') {
+  const faces = new Set();
+  for (const kind of fontSlots(identity)) {
+    const font = identity.fonts[kind];
+    for (const file of font.files) {
+      faces.add(`@font-face { font-family: "${font.family}"; src: url("${prefix}${file.path}"); font-weight: ${file.weight}; }`);
+    }
+  }
+  return [...faces].join('\n');
+}
